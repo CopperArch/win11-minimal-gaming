@@ -64,15 +64,92 @@ Add-Type -AssemblyName System.Drawing
 $script:angle    = 0                       # current rotation of the spinning light (degrees)
 $script:status   = "Starting Game Mode..." # last status line read from the file
 $script:started  = Get-Date
-$script:accent   = [System.Drawing.Color]::FromArgb(255,  76, 194, 255)  # cyan-blue "light"
-$script:accentDim= [System.Drawing.Color]::FromArgb(255,  38,  42,  50)  # dim base ring
+$script:accent   = [System.Drawing.Color]::FromArgb(255,  76, 194, 255)  # cyan-blue "light" — starting hue; the spinning arc/head then fade-cycles away from this each frame (see Get-HueColor)
+$script:accentDim= [System.Drawing.Color]::FromArgb(255,  38,  42,  50)  # dim base ring — stays fixed, only the bright arc/head cycle color
 $script:tick     = 0                       # frame counter (used to re-assert topmost)
+$script:hue      = 195.0                   # current hue (degrees) of the spinning arc/head — 195 = the starting cyan-blue
+
+# Smoothly fades the spinning arc/head through the color wheel (fixed
+# saturation/brightness matching the original cyan-blue accent, hue advances
+# a fraction of a degree per frame) rather than jumping between random
+# colors — each frame's color is barely different from the last, so it reads
+# as a continuous fade rather than a flicker.
+function Get-HueColor {
+    param([double]$Hue, [double]$Sat = 0.70, [double]$Val = 1.0)
+    $h = (($Hue % 360) + 360) % 360
+    $c = $Val * $Sat
+    $x = $c * (1 - [math]::Abs((($h / 60.0) % 2) - 1))
+    $m = $Val - $c
+    switch ([int]($h / 60)) {
+        0 { $r = $c; $g = $x; $b = 0 }
+        1 { $r = $x; $g = $c; $b = 0 }
+        2 { $r = 0; $g = $c; $b = $x }
+        3 { $r = 0; $g = $x; $b = $c }
+        4 { $r = $x; $g = 0; $b = $c }
+        default { $r = $c; $g = 0; $b = $x }
+    }
+    return [System.Drawing.Color]::FromArgb(255, [int](($r + $m) * 255), [int](($g + $m) * 255), [int](($b + $m) * 255))
+}
 
 # ── Starfield tunables ───────────────────────────────────────────────────────
 $script:starCount = 220     # how many stars are alive at once
 $script:warpSpeed = 0.010   # depth travelled toward the camera each frame (bigger = faster warp)
 $script:zNear     = 0.045   # depth at which a star has "passed" the camera and respawns
 $script:rng       = New-Object System.Random
+
+# ── Crawl text — a Star Wars-style opening crawl summarizing what this build
+# does/removes, scrolling up from the bottom and shrinking into the screen
+# centre (the same point the starfield radiates from) until it vanishes.
+# Drawn BEHIND the starfield in the paint order below, so the stars pass in
+# front of it rather than the other way around. Dark/muted and semi-
+# transparent so it reads as background flavor, not competing with the ring/
+# status text for attention.
+$script:crawlContent = @(
+    "Removing Microsoft Edge"
+    "Removing OneDrive"
+    "Disabling Windows Update (security patches still install automatically)"
+    "Stripping telemetry and diagnostics"
+    "Trimming Windows apps and features you don't need for gaming"
+    "Installing the latest GPU driver"
+    "Installing AMD chipset drivers"
+    "Installing Intel chipset and platform drivers"
+    "Updating network, audio, and Bluetooth drivers"
+    "Installing the .NET Desktop Runtime"
+    "Installing Steam"
+    "Setting up Big Picture autostart"
+    "Enabling dark mode"
+    "Setting your display to its best resolution"
+    "Setting display scaling to 150%"
+    "Applying a high-performance power plan"
+    "Disabling background services you don't need"
+    "Setting Helium as your default browser"
+    "Preparing your gaming desktop"
+)
+$script:crawlItems       = New-Object System.Collections.ArrayList
+$script:crawlNextIndex   = 0
+$script:crawlSpawnTimer  = 0
+$script:crawlSpawnEvery  = 55       # ticks between new lines (~1.8s at ~30fps)
+$script:crawlSpeed       = 0.0018   # progress/frame -> ~18s bottom-to-vanish, Star Wars pace
+$script:crawlFontFamily  = "Segoe UI"
+$script:crawlBaseSize    = 22.0
+$script:crawlColor       = [System.Drawing.Color]::FromArgb(255, 70, 80, 95)  # dark, muted
+$script:crawlFmt = New-Object System.Drawing.StringFormat
+$script:crawlFmt.Alignment     = [System.Drawing.StringAlignment]::Center
+$script:crawlFmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+$script:crawlBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(0, $script:crawlColor))
+$script:crawlFontCache = @{}
+# Fonts are the expensive part of drawing crawl text (construction +
+# measurement), so cache one per rounded pixel size and reuse it across every
+# line and every frame instead of allocating fresh ones ~30 times a second.
+function Get-CrawlFont {
+    param([single]$Size)
+    $key = [int]([math]::Round($Size))
+    if ($key -lt 2) { $key = 2 }
+    if (-not $script:crawlFontCache.ContainsKey($key)) {
+        $script:crawlFontCache[$key] = New-Object System.Drawing.Font($script:crawlFontFamily, [single]$key, [System.Drawing.FontStyle]::Bold)
+    }
+    return $script:crawlFontCache[$key]
+}
 
 function Read-Status {
     # Open with FileShare.ReadWrite so a concurrent writer (the caller updating
@@ -185,6 +262,15 @@ $form.Add_Shown({
     $script:centerFmt.Alignment     = [System.Drawing.StringAlignment]::Center
     $script:centerFmt.LineAlignment = [System.Drawing.StringAlignment]::Center
 
+    # Status text now carries specific, frequently-changing detail (what's
+    # downloading/installing right now, not just a section name), so it wraps
+    # onto two lines and gets a tighter fit than the centered ring/subtitle
+    # text: top-aligned, word-wrapped, ellipsis if a single line still overflows.
+    $script:statFmt = New-Object System.Drawing.StringFormat
+    $script:statFmt.Alignment     = [System.Drawing.StringAlignment]::Center
+    $script:statFmt.LineAlignment = [System.Drawing.StringAlignment]::Near
+    $script:statFmt.Trimming      = [System.Drawing.StringTrimming]::EllipsisWord
+
     $script:ready = $true
     $form.Invalidate()
 })
@@ -197,7 +283,34 @@ $form.Add_Paint({
     $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::ClearTypeGridFit
     $g.Clear([System.Drawing.Color]::Black)
 
-    # ── Starfield (drawn first, behind the ring/logo) ─────────────────────────
+    # ── Crawl text (drawn first — furthest back, so the starfield below
+    # renders on top of it and stars appear to pass through the text) ────────
+    # Fonts are cached by rounded size and the brush is a single reused
+    # instance with its Color swapped per line — with up to ~10 lines alive
+    # at once, allocating a fresh Font (an expensive GDI+ object to
+    # construct/measure) and Brush every single frame for every line was
+    # producing exactly the stutter this was fixed for; now the ~30Hz timer
+    # tick does no per-line allocation at all, just cache lookups and a
+    # struct copy for the rectangle.
+    foreach ($item in $script:crawlItems) {
+        $p = [double]$item.Progress
+        $yStart = $script:H + 30.0
+        $yVanish = $script:scy
+        $y = $yStart + (($yVanish - $yStart) * $p)
+        $scale = 1.0 - (0.92 * $p)   # shrinks to ~8% size right at the vanishing point
+        if ($scale -le 0.02) { continue }
+        $fadeIn  = [math]::Min(1.0, $p / 0.05)
+        $fadeOut = [math]::Min(1.0, (1.0 - $p) / 0.15)
+        $alpha = [int](130 * $fadeIn * $fadeOut)
+        if ($alpha -le 0) { continue }
+        $size = [single]([math]::Max(2.0, $script:crawlBaseSize * $scale))
+        $crawlFont = Get-CrawlFont -Size $size
+        $script:crawlBrush.Color = [System.Drawing.Color]::FromArgb($alpha, $script:crawlColor.R, $script:crawlColor.G, $script:crawlColor.B)
+        $crawlRect = New-Object System.Drawing.RectangleF(0, [single]($y - 40), [single]$script:W, [single]80)
+        $g.DrawString($item.Text, $crawlFont, $script:crawlBrush, $crawlRect, $script:crawlFmt)
+    }
+
+    # ── Starfield (drawn next, on top of the crawl text, behind the ring/logo) ──
     $scx = $script:scx; $scy = $script:scy; $ps = $script:projScale
     foreach ($s in $script:stars) {
         $z = $s.Z
@@ -242,9 +355,13 @@ $form.Add_Paint({
     $subRect = New-Object System.Drawing.RectangleF(0, [single]$subY, [single]$script:W, [single]($R * 0.4))
     $g.DrawString($Subtitle, $script:subFont, $script:subBrush, $subRect, $script:centerFmt)
 
+    # Wider/taller than before and top-aligned + word-wrapped (statFmt) — the
+    # status text now carries specific, frequently-changing detail (what's
+    # downloading/installing right now) rather than short section names, so it
+    # needs room to run onto a second line instead of getting clipped.
     $statY = $subY + ($R * 0.45)
-    $statRect = New-Object System.Drawing.RectangleF([single]($script:W * 0.15), [single]$statY, [single]($script:W * 0.70), [single]($R * 0.9))
-    $g.DrawString($script:status, $script:statFont, $script:statBrush, $statRect, $script:centerFmt)
+    $statRect = New-Object System.Drawing.RectangleF([single]($script:W * 0.10), [single]$statY, [single]($script:W * 0.80), [single]($R * 1.3))
+    $g.DrawString($script:status, $script:statFont, $script:statBrush, $statRect, $script:statFmt)
 })
 
 # ── Animation + status polling timer ─────────────────────────────────────────
@@ -252,6 +369,32 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 33   # ~30 fps
 $timer.Add_Tick({
     $script:angle = ($script:angle + 7) % 360
+
+    # Fade the spinning arc/head into the next color a fraction of a degree
+    # per frame — at ~30fps this is a full trip around the color wheel every
+    # ~24 seconds, slow enough to read as a smooth continuous fade rather than
+    # a color change you can actually catch happening.
+    $script:hue = ($script:hue + 0.5) % 360
+    $liveColor = Get-HueColor -Hue $script:hue
+    if ($script:arcPen)    { $script:arcPen.Color    = $liveColor }
+    if ($script:headBrush) { $script:headBrush.Color = $liveColor }
+
+    # Advance the crawl text: each line rises toward the vanishing point at the
+    # screen centre and is dropped once it gets there; a new line spawns at
+    # the bottom on a fixed interval, cycling through the content list.
+    if ($script:crawlItems -and $script:crawlItems.Count -gt 0) {
+        for ($ci = $script:crawlItems.Count - 1; $ci -ge 0; $ci--) {
+            $script:crawlItems[$ci].Progress += $script:crawlSpeed
+            if ($script:crawlItems[$ci].Progress -ge 1.0) { $script:crawlItems.RemoveAt($ci) }
+        }
+    }
+    $script:crawlSpawnTimer++
+    if ($script:crawlSpawnTimer -ge $script:crawlSpawnEvery) {
+        $script:crawlSpawnTimer = 0
+        $crawlText = $script:crawlContent[$script:crawlNextIndex % $script:crawlContent.Count]
+        $script:crawlNextIndex++
+        [void]$script:crawlItems.Add(@{ Text = $crawlText; Progress = 0.0 })
+    }
 
     # Advance the starfield: each star moves toward the camera; recycle it at
     # the far plane once it passes the camera or flies well off-screen.
@@ -266,12 +409,20 @@ $timer.Add_Tick({
         }
     }
 
-    # Every ~half-second, re-assert topmost so nothing (a transient window, the
-    # desktop repainting, Steam's own splash) can slip in front of the loader.
+    # Re-assert topmost + foreground EVERY frame (~30 Hz) — not just every half
+    # second — so nothing (a transient window, a SmartScreen/driver-install
+    # dialog, the desktop repainting, Steam's own splash) has more than one
+    # frame's worth of a chance to show through in front of the loader. This
+    # was previously throttled to every ~500ms, which left a real gap other
+    # windows could win. BringToFront + Activate additionally reclaims actual
+    # foreground/input focus, not just Z-order — a plain TopMost toggle can
+    # still lose to another window that also just set itself topmost.
     $script:tick++
-    if (($script:tick % 15) -eq 0) {
-        try { $form.TopMost = $false; $form.TopMost = $true } catch {}
-    }
+    try {
+        $form.TopMost = $false; $form.TopMost = $true
+        $form.BringToFront()
+        $form.Activate()
+    } catch {}
 
     $s = Read-Status
     if ($s -eq "__DONE__") { $timer.Stop(); $form.Close(); return }
@@ -289,8 +440,11 @@ $form.Add_KeyDown({ if ($_.KeyCode -eq [System.Windows.Forms.Keys]::Escape) { $t
 $form.Add_FormClosed({
     foreach ($r in @($script:starPen,$script:basePen,$script:arcPen,$script:headBrush,$script:whiteBrush,
                       $script:subBrush,$script:statBrush,$script:titleFont,$script:subFont,
-                      $script:statFont,$script:centerFmt,$timer)) {
+                      $script:statFont,$script:centerFmt,$script:crawlBrush,$script:crawlFmt,$timer)) {
         try { if ($r) { $r.Dispose() } } catch {}
+    }
+    if ($script:crawlFontCache) {
+        foreach ($f in $script:crawlFontCache.Values) { try { $f.Dispose() } catch {} }
     }
 })
 

@@ -38,10 +38,11 @@
          fallback to its official signed installer from GitHub (latest resolved
          via the GitHub API, run silently), and it's set as the default browser
          via SetUserFTA. Plus best-effort/non-fatal extra apps via winget:
-         Google Chrome, Files (file manager, set as default via a folder-open
-         override), Git for Windows (required by Claude Code), Claude Code, and
-         opencode. winget is kept in the image (slim-image.ps1 no longer removes
-         DesktopAppInstaller) specifically so these can install.
+         Google Chrome, Git for Windows (required by Claude Code), Claude Code,
+         and opencode — plus the .NET Desktop Runtime, a prerequisite several
+         modern app installs need. Explorer remains the file manager (no
+         override). winget is kept in the image (slim-image.ps1 no longer
+         removes DesktopAppInstaller) specifically so these can install.
       7. Windows autologon — enabled for the account this script is running
          as. Paired with the blank password autounattend.xml creates it
          with (see that file's header for the safety reasoning); the net
@@ -57,10 +58,14 @@
       9. Boot loader + first-boot Big Picture launch. A fullscreen, topmost
          "GAMING" splash (Show-BootLoader.ps1) covers the desktop for the whole
          first-boot install phase, showing a spinning progress ring and a live
-         status line of what's installing. At the end this script launches Big
-         Picture itself and then dismisses the loader — so the FIRST boot ends
-         in Steam too, not just every boot after it (the Startup shortcut only
-         fires from the second login onward).
+         status line. That status line now carries specific, frequently-updated
+         detail (e.g. "Downloading NVIDIA Game Ready Driver v571.96...",
+         "Installing AMD chipset driver...", "Installing Steam...") rather than
+         just the section name — every winget app install and every direct
+         vendor download/install calls Set-BootStatus itself. At the end this
+         script launches Big Picture itself and then dismisses the loader — so
+         the FIRST boot ends in Steam too, not just every boot after it (the
+         Startup shortcut only fires from the second login onward).
 
     HONEST LIMITS:
       - Appx removal already happened offline (slim-image.ps1) — nothing
@@ -166,6 +171,7 @@ function Install-WingetApp {
     if (-not $script:HaveNetwork) { Write-Log "    Skipping $Name — no network." "Yellow"; return $false }
     if (-not $script:WingetExe)   { Write-Log "    Skipping $Name — winget unavailable." "Yellow"; return $false }
     Write-Log "  Installing $Name ($Id)..."
+    Set-BootStatus "Installing $Name..."
     try {
         & $script:WingetExe install --id $Id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity | Out-Null
         if ($LASTEXITCODE -eq 0) { Write-Log "    $Name installed."; return $true }
@@ -178,12 +184,25 @@ function Install-WingetApp {
 # Small download helper — every fetch below wants the same "silence the progress
 # bar (it makes Invoke-WebRequest crawl) then restore it" dance, so do it once
 # here instead of repeating it at each call site. try/finally always restores.
+#
+# Also unblocks the download (removes the Zone.Identifier Mark-of-the-Web ADS)
+# before anything runs it. BUG FIXED: every installer fetched here previously
+# kept the "downloaded from the internet" flag, so the FIRST time Windows
+# SmartScreen saw one of these unrecognized-publisher executables it could pop
+# a blocking "Windows protected your PC" dialog — a real foreground window
+# that can appear over the topmost boot-loader splash (it re-asserts topmost
+# only every ~500ms) and, since several of these installs run with -Wait,
+# would silently stall first boot until someone clicked through it. These are
+# all first-party vendor installers this script downloads and runs itself
+# (NVIDIA/AMD/.NET/Steam/Helium — never arbitrary user content), so unblocking
+# them immediately after download is safe.
 function Get-File {
     param([string]$Uri, [string]$OutFile, [int]$TimeoutSec = 600)
     $old = $ProgressPreference
     $ProgressPreference = "SilentlyContinue"
     try { Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing -TimeoutSec $TimeoutSec }
     finally { $ProgressPreference = $old }
+    Unblock-File -Path $OutFile -ErrorAction SilentlyContinue
 }
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -501,6 +520,130 @@ if ($LASTEXITCODE -ne 0) {
 Write-Log "  Pinned never-sleep / never-display-off / no USB selective suspend / hibernate off."
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3c-2. DARK MODE — set as the default theme
+# ═══════════════════════════════════════════════════════════════════════════
+Write-Log "=== Dark mode ==="
+$PersonalizePath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+New-Item -Path $PersonalizePath -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $PersonalizePath -Name "AppsUseLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $PersonalizePath -Name "SystemUsesLightTheme" -Value 0 -PropertyType DWord -Force | Out-Null
+Write-Log "  Set apps + system theme to dark."
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3c-3. DISPLAY RESOLUTION — 4K if the connected display supports it, else
+#       2K (1440p), else 1080p
+# ═══════════════════════════════════════════════════════════════════════════
+# Queries the modes the ACTIVE display driver actually reports
+# (EnumDisplaySettings) rather than assuming — a TV or older monitor on the
+# same box may only offer 1080p. Picks the highest refresh rate available at
+# whichever resolution wins. Non-fatal: if this fails for any reason the
+# display is simply left at whatever Setup/the driver already chose.
+Write-Log "=== Display resolution (4K -> 2K -> 1080p, whichever the display supports) ==="
+try {
+    if (-not ("NativeDisplay" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class NativeDisplay {
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DEVMODE {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+        public int dmFields;
+        public int dmPositionX, dmPositionY;
+        public int dmDisplayOrientation, dmDisplayFixedOutput;
+        public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+        public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+    }
+    [DllImport("user32.dll", EntryPoint = "EnumDisplaySettingsA", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern int EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+    [DllImport("user32.dll", EntryPoint = "ChangeDisplaySettingsA", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern int ChangeDisplaySettings(ref DEVMODE devMode, int flags);
+    public const int ENUM_CURRENT_SETTINGS = -1;
+    public const int CDS_UPDATEREGISTRY = 0x01;
+    public const int DISP_CHANGE_SUCCESSFUL = 0;
+}
+"@ -ErrorAction Stop
+    }
+
+    # EnumDisplaySettings rejects a literal $null device name from PowerShell
+    # (marshals to something that isn't the true NULL pointer the API expects
+    # for "current display" — verified live: it returns ERROR_INVALID_PARAMETER)
+    # so resolve the actual primary-display device name via WinForms instead.
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $displayDevice = [System.Windows.Forms.Screen]::PrimaryScreen.DeviceName
+
+    $devModeSize = [int16][System.Runtime.InteropServices.Marshal]::SizeOf([Type][NativeDisplay+DEVMODE])
+    $candidates = [ordered]@{
+        "3840x2160" = @{ W = 3840; H = 2160; Best = $null }
+        "2560x1440" = @{ W = 2560; H = 1440; Best = $null }
+        "1920x1080" = @{ W = 1920; H = 1080; Best = $null }
+    }
+    $mode = New-Object -TypeName "NativeDisplay+DEVMODE"
+    $mode.dmSize = $devModeSize
+    $i = 0
+    while ([NativeDisplay]::EnumDisplaySettings($displayDevice, $i, [ref]$mode) -ne 0) {
+        foreach ($key in $candidates.Keys) {
+            $c = $candidates[$key]
+            if ($mode.dmPelsWidth -eq $c.W -and $mode.dmPelsHeight -eq $c.H) {
+                if (-not $c.Best -or $mode.dmDisplayFrequency -gt $c.Best.dmDisplayFrequency) {
+                    $candidates[$key].Best = $mode
+                }
+            }
+        }
+        $i++
+        $mode = New-Object -TypeName "NativeDisplay+DEVMODE"
+        $mode.dmSize = $devModeSize
+    }
+
+    $chosen = $null
+    $chosenLabel = $null
+    foreach ($key in $candidates.Keys) {
+        if ($candidates[$key].Best) { $chosen = $candidates[$key].Best; $chosenLabel = $key; break }
+    }
+
+    if (-not $chosen) {
+        Write-Log "  Could not find 4K/2K/1080p among the reported display modes — leaving resolution as-is." "Yellow"
+    } else {
+        $current = New-Object -TypeName "NativeDisplay+DEVMODE"
+        $current.dmSize = $devModeSize
+        [void][NativeDisplay]::EnumDisplaySettings($displayDevice, [NativeDisplay]::ENUM_CURRENT_SETTINGS, [ref]$current)
+        if ($current.dmPelsWidth -eq $chosen.dmPelsWidth -and $current.dmPelsHeight -eq $chosen.dmPelsHeight) {
+            Write-Log "  Display is already at $chosenLabel@$($chosen.dmDisplayFrequency)Hz — nothing to change."
+        } else {
+            $result = [NativeDisplay]::ChangeDisplaySettings([ref]$chosen, [NativeDisplay]::CDS_UPDATEREGISTRY)
+            if ($result -eq [NativeDisplay]::DISP_CHANGE_SUCCESSFUL) {
+                Write-Log "  Set display resolution to $chosenLabel @ $($chosen.dmDisplayFrequency)Hz."
+            } else {
+                Write-Log "  ChangeDisplaySettings returned $result for $chosenLabel — resolution left unchanged." "Yellow"
+            }
+        }
+    }
+} catch {
+    Write-Log "  Display resolution step failed (non-fatal, display left as-is): $_" "Yellow"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3c-4. DISPLAY SCALING — 150%
+# ═══════════════════════════════════════════════════════════════════════════
+# Sets the classic global HKCU DPI keys (LogPixels + Win8DpiScaling) rather
+# than the per-monitor PerMonitorSettings registry path — that path is keyed
+# by a monitor-specific identifier derived from EDID/instance data, so a
+# script can't reliably compute the right key for an arbitrary display sight
+# unseen; the global keys apply regardless of which monitor is connected.
+# HONEST LIMIT: like this script's other registry-only settings, Windows only
+# picks DPI scaling up at the next full logon, not live within the session
+# that's currently running this script.
+Write-Log "=== Display scaling (150%) ==="
+$DesktopPath = "HKCU:\Control Panel\Desktop"
+New-ItemProperty -Path $DesktopPath -Name "LogPixels" -Value 144 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $DesktopPath -Name "Win8DpiScaling" -Value 1 -PropertyType DWord -Force | Out-Null
+Write-Log "  Set display scaling to 150% (144 DPI) — takes effect at next login."
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 3d. FOOTPRINT REDUCTION — non-gaming Automatic services
 # ═══════════════════════════════════════════════════════════════════════════
 # Measured via a live process/service audit on the test VM (2026-07-25):
@@ -566,7 +709,36 @@ $script:WingetExe = Resolve-WingetExe -TimeoutSec 240
 if ($script:WingetExe) {
     Write-Log "  winget resolved at: $script:WingetExe"
 } else {
-    Write-Log "  winget could not be resolved at first boot — winget-only apps (Chrome, Files, Git, Claude Code, opencode) will be skipped; Steam/Helium fall back to their direct installers." "Yellow"
+    Write-Log "  winget could not be resolved at first boot — winget-only apps (Chrome, Git, Claude Code, opencode) will be skipped; Steam/Helium fall back to their direct installers." "Yellow"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3d-2. .NET DESKTOP RUNTIME — prerequisite for modern WinUI/WPF apps
+# ═══════════════════════════════════════════════════════════════════════════
+# Several current and future app installs on this image are built on WinUI 3
+# or WPF and need the .NET Desktop Runtime — it is NOT part of Windows and NOT
+# bundled by most app installers, so without it those apps fail to launch with
+# a "You must install or update .NET to run this application" dialog. winget
+# doesn't reliably carry every current .NET channel, so this fetches
+# Microsoft's official evergreen redirector link for the latest 10.0.x Windows
+# x64 build — aka.ms/dotnet/<channel>/... always resolves to the newest release
+# in that channel, so this never goes stale the way a pinned version URL would
+# — and installs it silently. Non-fatal: a failure here doesn't block first boot.
+Write-Log "=== .NET Desktop Runtime ==="
+if ($script:HaveNetwork) {
+    try {
+        $dotnetExe = Join-Path $env:TEMP "windowsdesktop-runtime-win-x64.exe"
+        Set-BootStatus "Downloading .NET Desktop Runtime..."
+        Get-File -Uri "https://aka.ms/dotnet/10.0/windowsdesktop-runtime-win-x64.exe" -OutFile $dotnetExe -TimeoutSec 300
+        Set-BootStatus "Installing .NET Desktop Runtime..."
+        $p = Start-Process -FilePath $dotnetExe -ArgumentList "/install", "/quiet", "/norestart" -Wait -PassThru
+        Write-Log "  .NET Desktop Runtime installer exit code: $($p.ExitCode) (0 or 3010 = success)." $(if ($p.ExitCode -in 0, 3010) { "Green" } else { "Yellow" })
+    } catch {
+        Write-Log "  .NET Desktop Runtime install failed (non-fatal): $_" "Yellow"
+        Write-Log "  Install manually later from https://dotnet.microsoft.com/download/dotnet/10.0" "Cyan"
+    }
+} else {
+    Write-Log "  No network — skipping .NET Desktop Runtime install." "Yellow"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -658,8 +830,10 @@ if (-not $gpus) {
             #    -s (silent) -clean (clean install) -noreboot directly.
             $nvExe = Join-Path $env:TEMP "nvidia-$($info.Version)-driver.exe"
             Write-Log "    Downloading $($info.DownloadURL) ..."
+            Set-BootStatus "Downloading NVIDIA Game Ready Driver v$($info.Version)..."
             Get-File -Uri $info.DownloadURL -OutFile $nvExe -TimeoutSec 1800
             Write-Log "    Installing NVIDIA driver silently (-s -clean -noreboot)..."
+            Set-BootStatus "Installing NVIDIA driver v$($info.Version)..."
             $p = Start-Process -FilePath $nvExe -ArgumentList "-s","-clean","-noreboot" -Wait -PassThru
             Write-Log "    NVIDIA driver installer exit code: $($p.ExitCode) (a reboot may be needed to fully apply)."
         } catch {
@@ -688,11 +862,13 @@ if (-not $gpus) {
             # (latest known good as of 2026-07: 26.7.1).
             $amdUrl = "https://drivers.amd.com/drivers/installer/26.7/whql/amd-software-adrenalin-edition-26.7.1-minimalsetup-260724_web.exe"
             $amdExe = Join-Path $env:TEMP "amd-adrenalin-web-setup.exe"
+            Set-BootStatus "Downloading AMD Software: Adrenalin Edition..."
             Get-File -Uri $amdUrl -OutFile $amdExe -TimeoutSec 600
 
             # -INSTALL = unattended install (the web setup fetches the full
             # package first, so give it a generous cap and don't block forever).
             Write-Log "    Installing AMD driver silently (-INSTALL) — the web setup downloads the full package first, this can take several minutes."
+            Set-BootStatus "Installing AMD graphics + chipset driver (this can take several minutes)..."
             $p = Start-Process -FilePath $amdExe -ArgumentList "-INSTALL" -PassThru
             if ($p.WaitForExit(1500000)) {   # up to 25 min
                 Write-Log "    AMD installer exit code: $($p.ExitCode) (a reboot may be needed to fully apply)."
@@ -728,6 +904,88 @@ if (-not $gpus) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 3e-2. AMD CHIPSET DRIVER — keyed off the CPU, not the GPU
+# ═══════════════════════════════════════════════════════════════════════════
+# BUG FIXED: the AMD branch above only runs when an AMD GPU is DETECTED, so an
+# AMD-CPU box paired with an NVIDIA or Intel discrete GPU previously got NO
+# chipset driver at all (SMBus, PSP/fTPM, USB4/PCIe controller mappings) —
+# those don't reliably come from winget or the Windows Update driver catalog
+# either. AMD's own Software/Adrenalin installer bundles the chipset driver and
+# installs it as part of a normal silent run with no extra flag needed, so
+# re-use that same installer here, gated on CPU vendor (Win32_Processor)
+# instead of GPU vendor. Skips itself if the GPU branch above already ran it
+# for an AMD GPU, so it never installs twice.
+Write-Log "=== AMD chipset driver (CPU-vendor keyed) ==="
+try {
+    $isAmdCpu = [bool](Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue |
+        Where-Object { $_.Manufacturer -match "AMD" })
+    $amdGpuAlreadyHandled = $false
+    if ($vendors) { $amdGpuAlreadyHandled = $vendors.ContainsKey("AMD") }
+
+    if (-not $isAmdCpu) {
+        Write-Log "  Not an AMD CPU — skipping."
+    } elseif ($amdGpuAlreadyHandled) {
+        Write-Log "  AMD GPU already triggered the AMD Software installer above (chipset installs as part of that run) — skipping a second install."
+    } elseif (-not $script:HaveNetwork) {
+        Write-Log "  No network — skipping AMD chipset driver install." "Yellow"
+    } else {
+        Write-Log "  AMD CPU detected with no AMD GPU — installing AMD Software (Adrenalin) anyway to get the bundled chipset driver."
+        # Same pinned web-setup link as the GPU branch above — see that block's
+        # note about this URL aging out over time (latest known good 2026-07).
+        $amdUrl = "https://drivers.amd.com/drivers/installer/26.7/whql/amd-software-adrenalin-edition-26.7.1-minimalsetup-260724_web.exe"
+        $amdExe = Join-Path $env:TEMP "amd-chipset-web-setup.exe"
+        Set-BootStatus "Downloading AMD chipset driver..."
+        Get-File -Uri $amdUrl -OutFile $amdExe -TimeoutSec 600
+        Set-BootStatus "Installing AMD chipset driver..."
+        $p = Start-Process -FilePath $amdExe -ArgumentList "-INSTALL" -PassThru
+        if ($p.WaitForExit(1500000)) {   # up to 25 min
+            Write-Log "    AMD chipset installer exit code: $($p.ExitCode) (a reboot may be needed to fully apply)."
+        } else {
+            Write-Log "    AMD chipset silent install exceeded 25 min — killing it." "Yellow"
+            try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+} catch {
+    Write-Log "  AMD chipset driver step failed (non-fatal): $_" "Yellow"
+    Write-Log "  Get AMD chipset drivers from https://www.amd.com/en/support" "Cyan"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3e-3. INTEL CHIPSET/PLATFORM DRIVERS — keyed off the CPU, not the GPU
+# ═══════════════════════════════════════════════════════════════════════════
+# Same bug class as the AMD chipset fix above, mirrored for Intel: the Intel
+# branch in the GPU-driver step only runs when an INTEL GPU IS DETECTED — so
+# an Intel-CPU box with an NVIDIA or AMD discrete GPU (a very common gaming
+# combo: Intel CPU + NVIDIA dGPU) never got Intel Driver & Support Assistant
+# at all. IDSA isn't GPU-only — once installed on an Intel-CPU system it also
+# scans for Intel chipset, Wi-Fi and Bluetooth driver updates, so skipping it
+# whenever the discrete GPU isn't Intel silently drops all of that too. Gate
+# it on CPU vendor (Win32_Processor) instead, same pattern as AMD. Skips
+# itself if the GPU branch above already installed it for an Intel GPU.
+Write-Log "=== Intel chipset/platform drivers (CPU-vendor keyed) ==="
+try {
+    $isIntelCpu = [bool](Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue |
+        Where-Object { $_.Manufacturer -match "Intel" })
+    $intelGpuAlreadyHandled = $false
+    if ($vendors) { $intelGpuAlreadyHandled = $vendors.ContainsKey("Intel") }
+
+    if (-not $isIntelCpu) {
+        Write-Log "  Not an Intel CPU — skipping."
+    } elseif ($intelGpuAlreadyHandled) {
+        Write-Log "  Intel GPU already installed Intel Driver & Support Assistant above — skipping a second install."
+    } elseif (-not $script:HaveNetwork) {
+        Write-Log "  No network — skipping Intel Driver & Support Assistant install." "Yellow"
+    } else {
+        Write-Log "  Intel CPU detected with no Intel GPU — installing Intel Driver & Support Assistant anyway for chipset/Wi-Fi/Bluetooth driver coverage."
+        if (-not (Install-WingetApp -Id "Intel.IntelDriverAndSupportAssistant" -Name "Intel Driver & Support Assistant")) {
+            Write-Log "    If that didn't take, get Intel chipset drivers from https://www.intel.com/content/www/us/en/download-center/home.html" "Cyan"
+        }
+    }
+} catch {
+    Write-Log "  Intel chipset/platform driver step failed (non-fatal): $_" "Yellow"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 3f. DRIVER UPDATES — non-GPU drivers now + a weekly check (WU-off-safe)
 # ═══════════════════════════════════════════════════════════════════════════
 # The GPU step above only handles the graphics driver. Everything else the
@@ -756,6 +1014,7 @@ try {
         #    weekly task will get to it. Non-fatal either way.
         if ($script:HaveNetwork) {
             Write-Log "  Running a one-off driver install pass (-Auto)..."
+            Set-BootStatus "Checking Windows Update for chipset/NIC/audio driver updates..."
             $p = Start-Process -FilePath "powershell.exe" `
                 -ArgumentList @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$DriverScript`"", "-Auto") `
                 -Wait -PassThru -WindowStyle Hidden
@@ -905,7 +1164,9 @@ if (-not (Test-Path $steamExe)) {
             Write-Log "  winget didn't land Steam — downloading the official Steam installer..."
             $installerPath = Join-Path $env:TEMP "SteamSetup.exe"
             try {
+                Set-BootStatus "Downloading Steam..."
                 Get-File -Uri "https://cdn.akamai.steamstatic.com/client/installer/SteamSetup.exe" -OutFile $installerPath
+                Set-BootStatus "Installing Steam..."
                 Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait
             } catch {
                 Write-Log "  Steam direct download failed (non-fatal): $_" "Yellow"
@@ -1075,8 +1336,10 @@ if (-not (Test-HeliumInstalled)) {
             if (-not $asset) { throw "No Windows installer asset in the latest Helium release." }
             $heliumExe = Join-Path $env:TEMP $asset.name
             Write-Log "    Downloading $($asset.browser_download_url) ..."
+            Set-BootStatus "Downloading Helium browser..."
             Get-File -Uri $asset.browser_download_url -OutFile $heliumExe -TimeoutSec 600
             Write-Log "    Installing Helium silently (/S)..."
+            Set-BootStatus "Installing Helium browser..."
             Start-Process -FilePath $heliumExe -ArgumentList "/S" -Wait
         } catch {
             Write-Log "    Helium direct-download install failed: $_" "Red"
@@ -1092,7 +1355,7 @@ if (Test-HeliumInstalled) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5b. EXTRA APPS — browsers, file manager, AI CLIs (all via winget)
+# 5b. EXTRA APPS — browsers, AI CLIs (all via winget)
 # ═══════════════════════════════════════════════════════════════════════════
 # All installed from winget's main community source. winget is deliberately
 # KEPT in the image for this (slim-image.ps1 no longer removes
@@ -1102,29 +1365,29 @@ if (Test-HeliumInstalled) {
 #   (Helium, the default browser, is installed separately in 5b-0 with a
 #    direct-download fallback — it's the machine's only browser, so it can't
 #    be left to this best-effort loop.)
-#   - Files (file manager)     FilesCommunity.Files  (set as default — see 5c)
 #   - Git for Windows          Git.Git           (REQUIRED by Claude Code — it
 #                                                  shells out to Git Bash)
 #   - Claude Code (AI CLI)     Anthropic.ClaudeCode
 #   - opencode (AI CLI)        SST.opencode
+# File management is left to Explorer — no separate file-manager app is
+# installed, and no folder-open override is applied.
 Write-Log "=== Extra apps (winget) ==="
 if (-not $script:WingetExe) {
-    Write-Log "  winget could not be resolved — skipping the extra winget apps (Chrome, Files, Git, Claude Code, opencode). Run them later once winget works: winget install --id <Id> -e" "Red"
+    Write-Log "  winget could not be resolved — skipping the extra winget apps (Chrome, Git, Claude Code, opencode). Run them later once winget works: winget install --id <Id> -e" "Red"
 } elseif (-not $script:HaveNetwork) {
     Write-Log "  No network — skipping the extra winget apps." "Red"
 } else {
     Install-WingetApp -Id "Google.Chrome"         -Name "Google Chrome"           | Out-Null
-    Install-WingetApp -Id "FilesCommunity.Files"  -Name "Files (file manager)"     | Out-Null
     Install-WingetApp -Id "Git.Git"               -Name "Git for Windows (Claude Code prerequisite)" | Out-Null
     Install-WingetApp -Id "Anthropic.ClaudeCode"  -Name "Claude Code"             | Out-Null
     Install-WingetApp -Id "SST.opencode"          -Name "opencode"               | Out-Null
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5c. DEFAULT APPS — Helium as default browser, Files as default file manager
+# 5c. DEFAULT APPS — Helium as default browser (Explorer stays the file manager)
 # ═══════════════════════════════════════════════════════════════════════════
-# Both are best-effort / non-fatal. Runs as the autologon user (Gamer), which
-# is correct — these are per-user (HKCU / UserChoice) settings.
+# Best-effort / non-fatal. Runs as the autologon user (Gamer), which is
+# correct — this is a per-user (HKCU / UserChoice) setting.
 Write-Log "=== Default apps ==="
 
 # ── Default browser: Helium via SetUserFTA ──────────────────────────────────
@@ -1152,9 +1415,14 @@ try {
         $sufZip = Join-Path $env:TEMP "SetUserFTA.zip"
         $sufDir = Join-Path $env:TEMP "SetUserFTA"
         Invoke-WebRequest -Uri "https://kolbi.cz/SetUserFTA.zip" -OutFile $sufZip -UseBasicParsing
+        Unblock-File -Path $sufZip -ErrorAction SilentlyContinue
         Expand-Archive -Path $sufZip -DestinationPath $sufDir -Force
+        # Extracted files inherit the zip's Mark-of-the-Web on modern Windows —
+        # unblock the .exe itself too, or SmartScreen can still catch it (see
+        # the note on Get-File above for why that matters during first boot).
         $sufExe = Get-ChildItem -Path $sufDir -Filter "SetUserFTA.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($sufExe) {
+            Unblock-File -Path $sufExe.FullName -ErrorAction SilentlyContinue
             foreach ($assocKey in @("https", "http", ".html", ".htm")) {
                 & $sufExe.FullName $assocKey $heliumProgId | Out-Null
             }
@@ -1167,50 +1435,21 @@ try {
     Write-Log "  Default-browser step failed (non-fatal): $_" "Yellow"
 }
 
-# ── Default file manager: Files via folder-open command override ─────────────
-# There is no official "default file manager" setting in Windows. Overriding
-# the per-user Directory/Drive "open" command points folder double-clicks at
-# Files instead of Explorer. Reversible (delete the HKCU\...\Classes keys);
-# Explorer still exists underneath. If this ever misbehaves, Files' own
-# Settings > "Set as default file manager" toggle is the guaranteed fallback.
+# ── Reset any prior "Files as default file manager" override back to Explorer ──
+# An older build of this project set Files as the default folder handler via
+# a per-user Directory/Drive/Folder "open" command override. This build no
+# longer installs Files at all, but if this updated script is re-run on a
+# machine originally provisioned by that older image, the leftover HKCU
+# override would keep silently routing folder opens at a now-uninstalled
+# Files alias forever — Explorer only actually gets default status back once
+# that override is removed, not merely by this script no longer setting it.
 try {
-    # The Files "stable" channel installs an app-execution alias named
-    # files-stable.exe (preview → files-preview.exe); there is no bare files.exe.
-    # This alias path is stable across app updates, unlike the versioned
-    # C:\Program Files\WindowsApps\Files_<ver>__... folder, so target the alias.
-    $appsDir = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
-    $filesAlias = Get-ChildItem $appsDir -Filter "files-stable.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $filesAlias) {
-        $filesAlias = Get-ChildItem $appsDir -Filter "*files*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    foreach ($cls in @("Directory", "Directory\Background", "Drive", "Folder")) {
+        Remove-Item -Path "HKCU:\Software\Classes\$cls\shell\open\command" -Force -ErrorAction SilentlyContinue
     }
-    if (-not $filesAlias) {
-        Write-Log "  Files launcher alias not found in WindowsApps — skipping default-file-manager step." "Yellow"
-    } else {
-        # %1 = the folder/drive path for Directory/Drive/Folder;
-        # %V is the same for the folder-window background verb.
-        # Directory  = a filesystem folder,  Drive = a volume root,
-        # Folder     = the base namespace class both derive from.
-        foreach ($map in @(
-            @{ Cls = "Directory";            Arg = "%1" },
-            @{ Cls = "Directory\Background"; Arg = "%V" },
-            @{ Cls = "Drive";                Arg = "%1" },
-            @{ Cls = "Folder";               Arg = "%1" }
-        )) {
-            $cmdKey = "HKCU:\Software\Classes\$($map.Cls)\shell\open\command"
-            New-Item -Path $cmdKey -Force -ErrorAction SilentlyContinue | Out-Null
-            Set-ItemProperty -Path $cmdKey -Name "(default)" -Value "`"$($filesAlias.FullName)`" `"$($map.Arg)`"" -ErrorAction SilentlyContinue
-            # The base image ships DelegateExecute={11dbb47c-...} on the HKLM
-            # open\command verb, which takes precedence over any command string
-            # and routes folder opens back into Explorer. Merely removing the
-            # (absent) HKCU value does nothing — the HKLM GUID still wins. We
-            # must SET an EMPTY DelegateExecute in HKCU so it shadows the HKLM
-            # GUID, letting our command string run instead.
-            Set-ItemProperty -Path $cmdKey -Name "DelegateExecute" -Value "" -ErrorAction SilentlyContinue
-        }
-        Write-Log "  Set Files as the default folder handler (Directory + Drive + Folder open command)."
-    }
+    Write-Log "  Cleared any prior default-file-manager override — Explorer is the file manager."
 } catch {
-    Write-Log "  Default-file-manager step failed (non-fatal, Explorer remains): $_" "Yellow"
+    Write-Log "  Could not clear a prior file-manager override (non-fatal, Explorer remains the file manager regardless): $_" "Yellow"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
