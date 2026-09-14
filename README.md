@@ -302,7 +302,7 @@ each stage yourself.
 With git:
 
 ```powershell
-git clone https://github.com/DGBrown21/win11-minimal-gaming.git
+git clone https://github.com/CopperArch/win11-minimal-gaming.git
 cd win11-minimal-gaming
 ```
 
