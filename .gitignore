@@ -26,3 +26,6 @@ upload-to-nextcloud.ps1
 # (e.g. _steam-drives.ps1 — reformats/labels one particular machine's Steam
 # drives by hardware id). Kept out of the portable repo.
 local/
+
+# ps2exe-compiled build output of Build-Iso.ps1 -- rebuildable from source, not tracked
+Build-Iso.exe

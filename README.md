@@ -91,21 +91,62 @@ different reliability characteristics:
   the classic warp look. To make sure the desktop never flashes at first boot,
   the answer file now launches this splash as its *own* first-logon command
   before the setup script runs, and the setup script adopts that already-running
-  splash rather than starting a second one; the loader also re-asserts topmost
-  every half-second so nothing slips in front of it. explorer.exe still stays
-  the real shell underneath (`on-device/Show-BootLoader.ps1`).
+  splash rather than starting a second one; the loader re-asserts topmost and
+  reclaims foreground **every frame (~30 Hz)** — not just every half-second as
+  before — plus `Unblock-File` strips the internet Mark-of-the-Web from every
+  installer this build downloads before running it, so Windows SmartScreen's
+  "Windows protected your PC" prompt can't pop up and show through the splash
+  mid-install. explorer.exe still stays the real shell underneath
+  (`on-device/Show-BootLoader.ps1`). The status line itself now carries
+  specific, live detail — "Downloading NVIDIA Game Ready Driver v571.96...",
+  "Installing AMD chipset driver...", "Installing Steam..." — rather than just
+  a section name: every app/driver install calls `Set-BootStatus` itself,
+  word-wrapped onto up to two lines. The spinning arc/head also continuously
+  fades through the color wheel (a fraction of a degree of hue per frame — a
+  full trip takes ~24 seconds) instead of staying a fixed cyan-blue. Behind
+  the ring, a dark, semi-transparent **Star Wars-style opening crawl**
+  summarizing what the build does and removes ("Removing Microsoft Edge",
+  "Installing the latest GPU driver", "Enabling dark mode", ...) scrolls up
+  from the bottom of the screen and shrinks into the same vanishing point the
+  starfield radiates from (~18 seconds bottom-to-vanish, matching the film's
+  pacing), drawn behind the starfield so the stars pass in front of the text
+  rather than the other way around.
 
-- **Latest GPU drivers on install.** Because Windows Update is disabled, the
-  GPU driver is fetched straight from the vendor at first boot: NVIDIA's newest
-  Game Ready Driver (resolved via NVIDIA's public lookup API and silent-
-  installed), Intel's official Driver & Support Assistant (winget), and AMD's
-  Adrenalin Edition **silent-installed via the installer's `-INSTALL` switch**
-  (the documented unattended path — the web setup downloads the full package
-  then installs it with no GUI), with the same installer also left on the
-  desktop as a manual fallback. Vendor is detected live; every branch is
-  best-effort and non-fatal. **This also fixes HDMI/DisplayPort audio on AMD
-  boxes** — those audio endpoints come from the GPU driver, so with no driver
-  there was no sound over the display cable.
+- **A real GUI ISO builder, not just a console window.** `Build-Iso.ps1`
+  (and a compiled `Build-Iso.exe`, via `ps2exe`) opens a window with a
+  progress bar, a live stage label ("Downloading Windows 11 (English
+  International, 64-bit)...", "Slimming the Windows image...", ...), and a
+  scrolling log of everything `build-windows.ps1` prints, instead of a bare
+  console. `Build-Iso.exe` bakes in a `requireAdmin` manifest so Windows
+  elevates it via UAC before it even starts — note this means it resolves its
+  own folder via the running exe's location rather than `$PSScriptRoot`
+  (empty inside a compiled binary), and skips the `.ps1`-only self-relaunch
+  path entirely. Pass `-NoGui` (works on both the `.ps1` and the `.exe`) for
+  the original plain-console behavior.
+
+- **Latest GPU drivers on install, for whichever vendor is actually present.**
+  Because Windows Update is disabled, the GPU driver is fetched straight from
+  the vendor at first boot: NVIDIA's newest Game Ready Driver (resolved via
+  NVIDIA's public lookup API and silent-installed), Intel's official Driver &
+  Support Assistant (winget), and AMD's Adrenalin Edition **silent-installed
+  via the installer's `-INSTALL` switch** (the documented unattended path —
+  the web setup downloads the full package then installs it with no GUI), with
+  the same installer also left on the desktop as a manual fallback. Vendor is
+  detected live from `Win32_VideoController`; every branch is best-effort and
+  non-fatal. **This also fixes HDMI/DisplayPort audio on AMD boxes** — those
+  audio endpoints come from the GPU driver, so with no driver there was no
+  sound over the display cable.
+
+- **AMD chipset and Intel chipset/platform drivers, keyed off the CPU — not
+  just whichever GPU happens to be installed.** AMD's Software/Adrenalin
+  installer bundles the chipset driver (SMBus, PSP/fTPM, USB4/PCIe controller
+  mappings) as part of a normal silent run, and Intel's Driver & Support
+  Assistant covers chipset/Wi-Fi/Bluetooth beyond just GPU — but both used to
+  only run when the matching GPU vendor was *also* detected. That silently
+  skipped an AMD-CPU + NVIDIA-GPU box, or an Intel-CPU + NVIDIA/AMD-dGPU box
+  (a very common gaming combo), leaving them with **no** chipset driver at
+  all. Both now run keyed on `Win32_Processor` (CPU vendor) instead, and skip
+  themselves if the GPU-vendor branch already installed the same thing.
 
 - **All other drivers, kept current without turning Windows Update back on**
   (`on-device/Update-Drivers.ps1`). The GPU step only covers graphics; chipset,
@@ -178,6 +219,37 @@ different reliability characteristics:
   an **Ultimate/High Performance power plan** with never-sleep + USB selective
   suspend off; plus `Win32PrioritySeparation`, HAGS, Game Mode, and Game DVR/
   overlay tweaks. Applied by `first-boot-tweaks.ps1`, live.
+
+- **Dark mode, 4K/2K/1080p display resolution, and 150% display scaling** —
+  applied live by `first-boot-tweaks.ps1`. Dark mode is the usual
+  `AppsUseLightTheme`/`SystemUsesLightTheme` registry pair. Resolution is set
+  via a direct `EnumDisplaySettings`/`ChangeDisplaySettings` P/Invoke against
+  the actual connected display's reported modes — not assumed — picking 4K if
+  the display supports it, else 2K (1440p), else 1080p, at the highest
+  available refresh rate for whichever wins; a TV or older monitor that only
+  offers 1080p correctly gets 1080p instead of a resolution it can't do.
+  Display **scaling** (150%) is a separate Windows concept from resolution —
+  set via the global `LogPixels`/`Win8DpiScaling` HKCU keys rather than the
+  per-monitor `PerMonitorSettings` path (which is keyed by a monitor-specific
+  identifier a script can't reliably compute sight-unseen) — and, like this
+  script's other registry-only settings, takes effect at the next full logon
+  rather than live within the session running first boot.
+
+- **.NET Desktop Runtime** — several current and future app installs on this
+  image are WinUI 3/WPF apps that need it and it is bundled by almost none of
+  them; without it they fail to launch with a "You must install or update
+  .NET to run this application" dialog. Fetched from Microsoft's official
+  evergreen `aka.ms/dotnet/<channel>/...` redirector (always the newest
+  release in that channel, so this never goes stale the way a pinned version
+  URL would) and installed silently.
+
+- **Explorer is the file manager — no separate app, no default-handler
+  override.** Earlier builds installed Files (`FilesCommunity.Files`) and
+  pointed folder-open commands at it via a per-user registry override.
+  Neither happens anymore; `first-boot-tweaks.ps1` also actively clears that
+  override if it's still present from an older image being re-provisioned, so
+  Explorer reliably gets default status back rather than relying on it simply
+  no longer being contested.
 
 ## What this deliberately does NOT do
 

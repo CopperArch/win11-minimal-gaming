@@ -33,9 +33,16 @@
     — you only need the "Deployment Tools" feature, not the whole ADK.
 
 .PARAMETER WinSkuId
-    Microsoft's internal SKU id for the ISO language/edition combo.
-    20047 = Windows 11 25H2 English International (UK) — the default,
-    matches autounattend.xml's en-GB settings.
+    Microsoft's internal SKU id for the ISO language/edition combo, on the
+    microsoft.com/software-download/windows11 page.
+    20047 = Windows 11, English International (UK) — the default, matches
+    autounattend.xml's en-GB settings. This always resolves to whatever
+    Windows 11 build Microsoft currently serves for that SKU (24H2, 25H2,
+    26H2, ... automatically — no update needed for a same-generation feature
+    update). It does NOT follow Microsoft to a future different-generation
+    release (e.g. a hypothetical "Windows 12") that gets its own separate
+    download page — see the "WHEN WINDOWS 12 SHIPS" comment block above the
+    download-link resolution in this file for what to update when that's real.
 
 .PARAMETER SkipDownload
     If a previous run already downloaded build\windows11.iso, reuse it
@@ -88,6 +95,28 @@ if ($SkipDownload -and (Test-Path $isoDownloadPath)) {
     Write-Host "==> -SkipDownload set and $isoDownloadPath already exists — reusing it."
 } else {
     Write-Host "==> Fetching a download link for SKU $WinSkuId from Microsoft..."
+    # ═══════════════════════════════════════════════════════════════════════
+    # WHEN WINDOWS 12 (or any future major release with its OWN download page)
+    # SHIPS, UPDATE THESE FOUR VALUES — everything below them is generic and
+    # doesn't need to change:
+    #   $OrgId, $ProfileId, $InstanceId  — scoped to the CURRENT
+    #     microsoft.com/software-download/windows11 page. A new major release
+    #     gets its own page (e.g. .../windows12) with its own fresh IDs — find
+    #     them the same way these were found: open that page's download flow
+    #     in a browser with dev tools open and read the equivalent requests to
+    #     vlscppe.microsoft.com/tags and ov-df.microsoft.com/mdt.js.
+    #   $WinSkuId (the -WinSkuId param default, top of this file) — the SKU id
+    #     for "English International, 64-bit" on that NEW page's SKU list.
+    # A same-generation feature update (e.g. 24H2 -> 25H2 -> 26H2) does NOT
+    # need any of this — it stays on the windows11 page under the same IDs,
+    # and GetProductDownloadLinksBySku below already always resolves to
+    # whatever Microsoft currently serves for this SKU, so those updates are
+    # already picked up automatically with no script change. This project
+    # deliberately does not attempt to auto-detect a next-generation release
+    # switch: there is no page/API to point at until Microsoft actually
+    # publishes one, so guessing at that ahead of time isn't something this
+    # script can do reliably — update the four values above when it's real.
+    # ═══════════════════════════════════════════════════════════════════════
     $OrgId = "y6jn8c31"
     $ProfileId = "606624d44113"
     $InstanceId = "560dc9f3-1aa5-4a2f-b63c-9e18f8d0e175"
@@ -174,6 +203,22 @@ New-Item -ItemType Directory -Path $extractDir | Out-Null
 Copy-Item -Path "$sourceRoot*" -Destination $extractDir -Recurse -Force
 
 Dismount-DiskImage -ImagePath $isoPath
+
+# ── 2b. Report the actual OS edition/version/build being serviced ────────
+# Read straight from the source image's own metadata rather than hardcoding
+# "Windows 11" anywhere — if Microsoft ships a future "Windows 12/13" under
+# this same SKU id, this reports whatever that image actually says it is.
+# The GUI (Build-Iso.ps1) parses this exact "==> Detected: ..." line to show
+# it near the top of the window. Non-fatal: a failure here doesn't block the
+# build, it just means the GUI won't have a version line to show.
+try {
+    $sourceImage = Join-Path $extractDir "sources\install.esd"
+    if (-not (Test-Path $sourceImage)) { $sourceImage = Join-Path $extractDir "sources\install.wim" }
+    $wimInfo = Get-WindowsImage -ImagePath $sourceImage -Index 1 -ErrorAction Stop
+    Write-Host "==> Detected: $($wimInfo.ImageName) - Build $($wimInfo.Version)"
+} catch {
+    Write-Host "==> Could not read source image version info (non-fatal): $_" -ForegroundColor Yellow
+}
 
 # ── 3. Slim install.wim down (offline DISM servicing) ───────────────────
 # This is the actual size-reduction work — see slim-image.ps1's header.
